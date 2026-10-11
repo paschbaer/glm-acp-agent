@@ -62,7 +62,7 @@ import { SessionLifecycle, type TransitionLease } from "./session-lifecycle.js";
 import { checkModelTransition } from "./model-transition.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
-  discoverSlashCommands,
+  discoverSessionCommands,
   parseSlashCommand,
   renderSlashCommand,
   type SlashCommand,
@@ -70,6 +70,12 @@ import {
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
+import {
+  PlanUsageMonitor,
+  formatPlanUsageStatus,
+  planStatusEnabled,
+  type PlanUsage,
+} from "../llm/plan-usage.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
 import { validateStreamCompletion } from "../llm/stream-state.js";
 import {
@@ -239,6 +245,11 @@ export interface GlmAcpAgentOptions {
     getMaxOutputTokens?: () => number;
   };
   /**
+   * Override the coding-plan usage source (used in tests). When undefined the
+   * agent lazily creates a PlanUsageMonitor backed by the Z.AI quota endpoint.
+   */
+  planUsage?: { current(force?: boolean): Promise<PlanUsage | undefined> };
+  /**
    * Maximum number of model/tool turns per single prompt. Default 100,
    * overridable via `$ACP_GLM_MAX_TURNS`.
    */
@@ -321,6 +332,14 @@ export class GlmAcpAgent implements Agent {
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
   private readonly shutdownDrainTimeoutMs: number;
+  /** Coding-plan quota source (account-wide); lazy — see `planUsageSource`. */
+  private planUsage: { current(force?: boolean): Promise<PlanUsage | undefined> } | null;
+  /**
+   * Sessions that already received the one-time plan status announcement.
+   * Keyed weakly on the SessionState object, so a replaced state (e.g. after
+   * restore) legitimately re-receives the announcement once.
+   */
+  private readonly planStatusAnnounced = new WeakSet<SessionState>();
 
   constructor(
     private connection: AgentSideConnection,
@@ -341,6 +360,10 @@ export class GlmAcpAgent implements Agent {
     this.mcpConnector = options.mcpConnector ?? options.connectSessionMcpServers ?? connectSessionMcpServers;
     this.connectMcpServers = this.mcpConnector;
     this.shutdownDrainTimeoutMs = options.shutdownDrainTimeoutMs ?? 4_000;
+    // Lazy like the GLM client: constructing the monitor reads credentials and
+    // parses ACP_GLM_BASE_URL, which a best-effort status feature must not do
+    // (or fail on) before it is actually needed.
+    this.planUsage = options.planUsage ?? null;
     this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
   }
 
@@ -495,12 +518,13 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: "default",
       thoughtLevel,
-      commands: discoverSlashCommands(params.cwd),
+      commands: discoverSessionCommands(params.cwd),
       displayText: new WeakMap(),
       lifecycle,
       });
 
       this.scheduleAvailableCommands(sessionId);
+      this.schedulePlanStatusAnnouncement(sessionId);
 
       return {
         sessionId,
@@ -543,6 +567,71 @@ export class GlmAcpAgent implements Agent {
         },
       });
     }, 0);
+  }
+
+  /**
+   * Announce the GLM coding-plan quota (5h/weekly usage and reset times) once
+   * per session as a transient `agent_message_chunk` — notification only, so
+   * it is neither persisted nor replayed on `session/load`. ACP has no
+   * persistent status-bar channel (the `session_info_update` payload carries
+   * only title/updatedAt, and unknown fields are stripped by conformant
+   * clients), so this announcement plus the on-demand `/plan` command are the
+   * spec-conformant surfaces. Fire-and-forget by design: quota display must
+   * never delay session handling, and every failure mode (no key, network,
+   * undocumented-endpoint drift, `GLM_ACP_PLAN_STATUS=0`) degrades to
+   * silence. Deferred like `scheduleAvailableCommands` so the notification
+   * lands behind the response that establishes the session id.
+   */
+  private schedulePlanStatusAnnouncement(sessionId: string): void {
+    if (!planStatusEnabled()) return;
+    const planUsage = (this.planUsage ??= new PlanUsageMonitor());
+    setTimeout(() => {
+      void planUsage
+        .current()
+        .then((usage) => {
+          const session = this.sessions.get(sessionId);
+          if (!usage || !session || session.closed || session.closing) return;
+          if (this.planStatusAnnounced.has(session)) return;
+          this.planStatusAnnounced.add(session);
+          void safeSessionUpdate(this.connection, {
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: formatPlanUsageStatus(usage) },
+            },
+          });
+        })
+        .catch(() => undefined);
+    }, 0);
+  }
+
+  /**
+   * Answer the built-in `/plan` command: force a fresh quota read and reply as
+   * a transient agent message, without a model turn and without touching the
+   * persisted conversation.
+   */
+  private async handlePlanCommand(
+    sessionId: string,
+    connection: AgentSideConnection
+  ): Promise<PromptResponse> {
+    const planUsage = (this.planUsage ??= new PlanUsageMonitor());
+    let text: string;
+    if (!planStatusEnabled()) {
+      text = "Coding plan status is disabled (GLM_ACP_PLAN_STATUS=0).";
+    } else {
+      const usage = await planUsage.current(true);
+      text = usage
+        ? formatPlanUsageStatus(usage)
+        : "Coding plan status is unavailable right now (no API key, or the usage endpoint did not respond).";
+    }
+    await safeSessionUpdate(connection, {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+      },
+    });
+    return { stopReason: "end_turn" };
   }
 
   async unstable_setSessionModel(
@@ -882,6 +971,19 @@ export class GlmAcpAgent implements Agent {
       }
       if (abortController.signal.aborted || !ownsPrompt()) {
         return cancelledResponse();
+      }
+
+      // Built-in `/plan` command: answer straight from the quota monitor —
+      // no model turn, no persisted conversation changes. Only intercept when
+      // the builtin is still the active definition (a project/user `plan.md`
+      // shadows it and takes over, see discoverSessionCommands).
+      if (
+        session.commands.some((c) => c.name === "plan" && c.source === "builtin") &&
+        /^\/plan(?:\s|$)/.test(renderPromptBlocks(params.prompt).plainText.trim())
+      ) {
+        const planResponse = await this.handlePlanCommand(params.sessionId, promptConnection);
+        if (userMessageId) planResponse.userMessageId = userMessageId;
+        return planResponse;
       }
 
       // Convert ACP content blocks into a GLM user message. Most models receive
@@ -1398,7 +1500,7 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
-      commands: discoverSlashCommands(params.cwd),
+      commands: discoverSessionCommands(params.cwd),
       // Re-key onto the cloned messages: the parent's map is keyed by the
       // originals, which the fork no longer holds.
       displayText: deserializeRestoredDisplayText(
@@ -1434,6 +1536,7 @@ export class GlmAcpAgent implements Agent {
     // Notify on the *created* session id — the parent thread's command list is
     // unchanged and a notify there would repaint the wrong menu.
     this.scheduleAvailableCommands(newSessionId);
+    this.schedulePlanStatusAnnouncement(newSessionId);
 
     return {
       sessionId: newSessionId,
@@ -1546,7 +1649,7 @@ export class GlmAcpAgent implements Agent {
           mcpTools: provisional,
           mode: restoreSource.mode,
           thoughtLevel: resolveThoughtLevel(restoreSource.model, restoreSource.thoughtLevel ?? "max"),
-          commands: discoverSlashCommands(params.cwd),
+          commands: discoverSessionCommands(params.cwd),
           displayText: deserializeRestoredDisplayText(
             restoreSource.messages,
             restoredMessages,
@@ -1609,6 +1712,7 @@ export class GlmAcpAgent implements Agent {
           throw new Error(`Session restore cancelled: ${params.sessionId}`);
         }
         this.scheduleAvailableCommands(params.sessionId);
+        this.schedulePlanStatusAnnouncement(params.sessionId);
         return {
           models: this.modelsState(restored.model),
           modes: this.modesState(restored.mode),

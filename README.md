@@ -43,6 +43,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
 - **Token usage reporting** – aggregated usage is returned on the `session/prompt` response
+- **Coding-plan status** – the current Coding Plan quota (5-hour window and weekly window, each as a used percentage with its reset time in local time) is announced once per session as a transient agent message, and is available on demand via the built-in `/plan` command (advertised in the `/` menu; answers without a model turn). Data comes from the Z.AI usage endpoint next to the chat API (same origin as `ACP_GLM_BASE_URL`) and is best-effort: if the endpoint is unreachable or changes shape, the announcement is silently omitted and `/plan` reports unavailability. Set `GLM_ACP_PLAN_STATUS=0` to disable the feature entirely. (ACP has no persistent status-bar channel — `session_info_update` carries only title/updatedAt — so the announcement plus `/plan` are the spec-conformant surfaces; a project-level `.claude/commands/plan.md` shadows the builtin.)
 
 ---
 
@@ -217,6 +218,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_STREAM_IDLE_TIMEOUT_MS` | No | `300000` | Idle deadline in milliseconds for a stalled model-provider stream read; invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
+| `GLM_ACP_PLAN_STATUS` | No | `1` | Set to `0` (or `false`/`off`) to disable the Coding Plan status feature (session announcement and the `/plan` command's quota request) |
 | `ACP_GLM_DEBUG` | No | — | Set to `true` or `1` to enable verbose debug logging to stderr (shows model selection, API key resolution, tool calls, and usage stats) |
 | `XDG_CONFIG_HOME` | No | `~/.config` | Where the credentials file is read/written |
 

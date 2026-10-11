@@ -23,6 +23,10 @@ process.env["HOME"] = isolatedHome;
 // os.homedir() uses USERPROFILE on Windows, where HOME is not authoritative.
 process.env["USERPROFILE"] = isolatedHome;
 
+// Keep the coding-plan status line (and its real quota request) out of every
+// test by default; the plan-status tests below opt back in explicitly.
+process.env["GLM_ACP_PLAN_STATUS"] = "0";
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -3430,7 +3434,7 @@ test("newSession advertises commands discovered under the session cwd", async ()
     const commands = updates[0]?.update.availableCommands ?? [];
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["deploy"]
+      ["deploy", "plan"]
     );
     assert.equal(commands[0]?.description, "Ship the current branch");
     assert.equal(commands[0]?.input?.hint, "<environment>");
@@ -3453,7 +3457,7 @@ test("advertised command names carry no leading slash", async () => {
     const commands = commandUpdates(conn)[0]?.update.availableCommands ?? [];
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["audit", "deploy"]
+      ["audit", "deploy", "plan"]
     );
     for (const command of commands) {
       assert.ok(!command.name.startsWith("/"), `${command.name} should not start with /`);
@@ -3471,7 +3475,10 @@ test("newSession advertises an empty list when the cwd has no commands", async (
     await agent.newSession({ cwd, mcpServers: [] });
     await flushNotifications();
 
-    assert.deepEqual(commandUpdates(conn)[0]?.update.availableCommands, []);
+    assert.deepEqual(
+      commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
+      ["plan"]
+    );
   } finally {
     cleanup();
   }
@@ -3512,7 +3519,7 @@ test("loadSession advertises commands after replaying history", async () => {
     assert.equal(kinds[kinds.length - 1], "available_commands_update");
     assert.deepEqual(
       commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
-      ["deploy"]
+      ["deploy", "plan"]
     );
   } finally {
     cleanupCwd();
@@ -3568,7 +3575,7 @@ test("resumeSession advertises commands for the resumed cwd", async () => {
 
     assert.deepEqual(
       commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
-      ["deploy"]
+      ["deploy", "plan"]
     );
   } finally {
     cleanupCwd();
@@ -3923,3 +3930,251 @@ test("resumeSession carries the sidecar forward so a later save keeps it", async
     cleanupStore();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Coding-plan status (one-time announcement + /plan command)
+// ---------------------------------------------------------------------------
+
+const PLAN_USAGE_FIXTURE = {
+  fiveHour: { usedPercentage: 29, resetAtMs: Date.now() + 3_600_000 },
+  weekly: { usedPercentage: 22, resetAtMs: Date.now() + 5 * 86_400_000 },
+  planLevel: "max",
+} as const;
+
+function planMessages(conn: ConnectionStub): Array<string> {
+  return conn.updates
+    .map((u) => u.update as { sessionUpdate?: string; content?: { text?: unknown } })
+    .filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        typeof u.content?.text === "string" &&
+        u.content.text.startsWith("GLM plan")
+    )
+    .map((u) => u.content!.text as string);
+}
+
+/** Last agent message text of any kind, or undefined when none was sent. */
+function lastAgentText(conn: ConnectionStub): string | undefined {
+  const texts = conn.updates
+    .map((u) => u.update as { sessionUpdate?: string; content?: { text?: unknown } })
+    .filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        typeof u.content?.text === "string"
+    )
+    .map((u) => u.content!.text as string);
+  return texts.at(-1);
+}
+
+async function settlePlanStatus(): Promise<void> {
+  // The announcement defers via setTimeout(0) and then awaits the usage
+  // source; two macrotask turns cover both hops.
+  await flushNotifications();
+  await flushNotifications();
+}
+
+/** Re-enable the plan status feature for one test (bootstrap disables it). */
+function withPlanStatusEnabled<T>(fn: () => Promise<T>): Promise<T> {
+  process.env["GLM_ACP_PLAN_STATUS"] = "1";
+  return fn().finally(() => {
+    process.env["GLM_ACP_PLAN_STATUS"] = "0";
+  });
+}
+
+test("plan status is announced once per session as a transient agent message", async () => {
+  await withPlanStatusEnabled(async () => {
+    const conn = createConnectionStub();
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: null,
+      planUsage: { async current() { return PLAN_USAGE_FIXTURE; } },
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    await settlePlanStatus();
+    const announced = planMessages(conn);
+    assert.equal(announced.length, 1);
+    assert.match(announced[0]!, /5h used 29%/);
+    assert.match(announced[0]!, /week used 22%/);
+
+    // A second prompt must not re-announce (one-time per session state).
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+    await settlePlanStatus();
+    assert.equal(planMessages(conn).length, 1);
+  });
+});
+
+test("plan status stays silent when usage is unavailable", async () => {
+  await withPlanStatusEnabled(async () => {
+    const conn = createConnectionStub();
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: null,
+      planUsage: { async current() { return undefined; } },
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+    await settlePlanStatus();
+    assert.equal(planMessages(conn).length, 0);
+  });
+});
+
+test("plan status is skipped entirely when disabled via GLM_ACP_PLAN_STATUS", async () => {
+  const conn = createConnectionStub();
+  let fetches = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: null,
+    planUsage: {
+      async current() {
+        fetches += 1;
+        return PLAN_USAGE_FIXTURE;
+      },
+    },
+  });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+  await settlePlanStatus();
+  assert.equal(planMessages(conn).length, 0);
+  assert.equal(fetches, 0);
+});
+
+test("/plan answers from the monitor without a model turn", async () => {
+  await withPlanStatusEnabled(async () => {
+    const conn = createConnectionStub();
+    let modelTurns = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelTurns += 1;
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    let forcedReads = 0;
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: null,
+      planUsage: {
+        async current(force = false) {
+          if (force) forcedReads += 1;
+          return PLAN_USAGE_FIXTURE;
+        },
+      },
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    const response = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/plan" }],
+      messageId: "msg-1",
+    });
+
+    assert.deepEqual(response, { stopReason: "end_turn", userMessageId: "msg-1" });
+    assert.equal(modelTurns, 0);
+    assert.equal(forcedReads, 1);
+    const replies = planMessages(conn).filter((m) => m.includes("week used 22%"));
+    assert.ok(replies.length >= 1, "expected a /plan reply containing the weekly usage");
+  });
+});
+
+test("/plan reports unavailability and respects the opt-out", async () => {
+  const conn = createConnectionStub();
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: null,
+    planUsage: { async current() { return undefined; } },
+  });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // Bootstrap disabled the feature: /plan must say so without fetching.
+  const disabled = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/plan" }] });
+  assert.equal(disabled.stopReason, "end_turn");
+  assert.match(lastAgentText(conn)!, /disabled/);
+
+  await withPlanStatusEnabled(async () => {
+    const unavailable = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/plan" }],
+    });
+    assert.equal(unavailable.stopReason, "end_turn");
+    assert.match(lastAgentText(conn)!, /unavailable/);
+  });
+});
+
+test("the /plan builtin is advertised and a project command shadows it", async () => {
+  const conn = createConnectionStub();
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await flushNotifications();
+
+  const commands = conn.updates
+    .map((u) => u.update as { sessionUpdate?: string; availableCommands?: Array<{ name: string }> })
+    .filter((u) => u.sessionUpdate === "available_commands_update")
+    .flatMap((u) => u.availableCommands ?? []);
+  assert.ok(commands.some((c) => c.name === "plan"), "builtin /plan must be advertised");
+
+  // A project-level plan.md shadows the builtin; /plan then reaches the model
+  // instead of being answered by the monitor intercept.
+  const { cwd, cleanup } = makeTempCwd({
+    ".claude/commands/plan.md": "---\ndescription: custom plan\n---\nCustom plan instructions.",
+  });
+  try {
+    let modelTurns = 0;
+    const countingGlm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelTurns += 1;
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const shadowed = new GlmAcpAgent(conn as never, { glm: countingGlm, sessionStore: null });
+    await shadowed.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId: shadowedId } = await shadowed.newSession({ cwd, mcpServers: [] });
+
+    const response = await shadowed.prompt({
+      sessionId: shadowedId,
+      prompt: [{ type: "text", text: "/plan" }],
+    });
+    assert.equal(response.stopReason, "end_turn");
+    assert.equal(modelTurns, 1, "shadowed /plan must run the model, not the intercept");
+  } finally {
+    cleanup();
+  }
+});
+

@@ -10,6 +10,11 @@ import { GlmAcpAgent } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
+// The GLM stub server below parses every request as JSON; the coding-plan
+// status probe (derived from ACP_GLM_BASE_URL) would send it an empty-body
+// GET. Keep it out of these tests.
+process.env["GLM_ACP_PLAN_STATUS"] = "0";
+
 async function withProvider(
   frames: unknown[], run: (client: GlmClient, requests: unknown[]) => Promise<void>,
 ): Promise<void> {

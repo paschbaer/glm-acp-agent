@@ -9,6 +9,11 @@ import { GlmClient, type GlmMessage, type GlmStreamChunk } from "../llm/glm-clie
 import { GlmAcpAgent } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
 
+// The GLM stub server below answers every request with an SSE chat stream;
+// the coding-plan status probe (derived from ACP_GLM_BASE_URL) would send it
+// an empty-body GET and derail the request log. Keep it out of these tests.
+process.env["GLM_ACP_PLAN_STATUS"] = "0";
+
 for (const display of ["true", "false"]) {
   test(`reasoning survives HTTP tool round, save/load and fork with display=${display}`, async () => {
     const cwd = mkdtempSync(join(tmpdir(), "glm-reasoning-"));

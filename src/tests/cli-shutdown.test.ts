@@ -10,6 +10,12 @@ import { fileURLToPath } from "node:url";
 import { Readable, Writable } from "node:stream";
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
+// The spawned CLI child talks to a strict GLM stub server (every request is
+// parsed as JSON) and must exit on demand; the coding-plan status probe
+// (derived from ACP_GLM_BASE_URL) would break both. The child inherits this
+// via `...process.env`.
+process.env["GLM_ACP_PLAN_STATUS"] = "0";
+
 const AGENT_ENTRY = fileURLToPath(new URL("../index.js", import.meta.url));
 
 function wait(ms: number): Promise<void> {

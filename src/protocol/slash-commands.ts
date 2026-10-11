@@ -95,6 +95,32 @@ export function discoverSlashCommands(cwd: string): SlashCommand[] {
 }
 
 /**
+ * Commands the agent implements itself, ahead of anything discovered on disk.
+ * Identified by `source: "builtin"` so the prompt path can intercept them
+ * without a model turn. A same-named project/user definition still shadows the
+ * builtin (last writer wins in {@link discoverSessionCommands}).
+ */
+export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<SlashCommand> = [
+  {
+    name: "plan",
+    description: "Show GLM Coding Plan usage (5h/weekly quota and reset times).",
+    body: "Show the current GLM Coding Plan usage status.",
+    source: "builtin",
+  },
+];
+
+/**
+ * Built-in commands plus everything discovered under `.claude/`, sorted by
+ * name — the list a session advertises via `available_commands_update`.
+ */
+export function discoverSessionCommands(cwd: string): SlashCommand[] {
+  const found = new Map<string, SlashCommand>();
+  for (const command of BUILTIN_SLASH_COMMANDS) found.set(command.name, { ...command });
+  for (const command of discoverSlashCommands(cwd)) found.set(command.name, command);
+  return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
  * Recursively read `*.md` files under a `commands/` directory. Nested files are
  * namespaced with `:` (`commands/review/pr.md` → `review:pr`), matching how
  * Claude Code names subdirectory commands.
